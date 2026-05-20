@@ -7,7 +7,14 @@ import {
   Smartphone, 
   Activity, 
   Send,
-  ChevronRight
+  ChevronRight,
+  Zap,
+  Check,
+  X,
+  AlertCircle,
+  History,
+  Settings,
+  Eye
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { clsx, type ClassValue } from 'clsx';
@@ -18,36 +25,75 @@ function cn(...inputs: ClassValue[]) {
 }
 
 interface LogEntry {
+  id?: number;
   type: 'system' | 'adb' | 'ai' | 'error';
   message: string;
   result?: string;
   timestamp: string;
 }
 
+interface AIResponse {
+  response: string;
+  predictedCommand?: string;
+  confidence?: number;
+  sessionId: string;
+}
+
+interface DeviceInfo {
+  model: string;
+  androidVersion: string;
+  batteryLevel: number;
+  timestamp: string;
+}
+
+interface CommandConfirmation {
+  sessionId: string;
+  predictedCommand: string;
+  confidence: number;
+  aiResponse: string;
+}
+
 const App: React.FC = () => {
-  const [, setSocket] = useState<Socket | null>(null);
+  const [socket, setSocket] = useState<Socket | null>(null);
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [adbStatus, setAdbStatus] = useState<{ connected: boolean; devices: string[] }>({ connected: false, devices: [] });
-  const [agentState, setAgentState] = useState<'idle' | 'processing'>('idle');
-  const [selectedModel, setSelectedModel] = useState('Gemini 1.5 Pro');
+  const [adbStatus, setAdbStatus] = useState<{ connected: boolean; devices: any[] }>({ 
+    connected: false, 
+    devices: [] 
+  });
+  const [agentState, setAgentState] = useState<'idle' | 'processing' | 'confirming'>('idle');
+  const [selectedModel, setSelectedModel] = useState('Gemini');
   const [cliInput, setCliInput] = useState('');
   const [screenshot, setScreenshot] = useState<string | null>(null);
+  const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null);
+  const [selectedDevice, setSelectedDevice] = useState<string>('');
+  const [commandConfirmation, setCommandConfirmation] = useState<CommandConfirmation | null>(null);
+  const [showHistory, setShowHistory] = useState(false);
+  const [commandHistory, setCommandHistory] = useState<any[]>([]);
+  const [vlaTrigger, setVlaTrigger] = useState(false);
+  const [executionResult, setExecutionResult] = useState<string | null>(null);
   
   const logEndRef = useRef<HTMLDivElement>(null);
 
+  // Initialize WebSocket connection
   useEffect(() => {
     const newSocket = io('http://localhost:3001');
     setSocket(newSocket);
 
     newSocket.on('log', (log: any) => {
-      setLogs(prev => [...prev, { ...log, timestamp: new Date().toLocaleTimeString() }].slice(-100));
+      setLogs(prev => [...prev, { 
+        ...log, 
+        timestamp: log.timestamp || new Date().toLocaleTimeString() 
+      }].slice(-100));
     });
 
     newSocket.on('adb_status', (status: any) => {
       setAdbStatus(status);
+      if (status.devices.length > 0 && !selectedDevice) {
+        setSelectedDevice(status.devices[0].id);
+      }
     });
 
-    newSocket.on('agent_state', (state: 'idle' | 'processing') => {
+    newSocket.on('agent_state', (state: 'idle' | 'processing' | 'confirming') => {
       setAgentState(state);
     });
 
@@ -56,20 +102,84 @@ const App: React.FC = () => {
     };
   }, []);
 
+  // Auto-scroll logs
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
 
+  // Fetch device info
+  useEffect(() => {
+    if (selectedDevice && adbStatus.connected) {
+      const fetchDeviceInfo = async () => {
+        try {
+          const res = await axios.get('http://localhost:3001/api/adb/device-info', {
+            params: { deviceId: selectedDevice }
+          });
+          if (res.data.success) {
+            setDeviceInfo(res.data);
+          }
+        } catch (err) {
+          console.error('Failed to fetch device info:', err);
+        }
+      };
+      
+      fetchDeviceInfo();
+      const interval = setInterval(fetchDeviceInfo, 10000); // Update every 10s
+      return () => clearInterval(interval);
+    }
+  }, [selectedDevice, adbStatus.connected]);
+
+  // Fetch command history
+  useEffect(() => {
+    const fetchHistory = async () => {
+      try {
+        const res = await axios.get('http://localhost:3001/api/adb/command-history', {
+          params: { limit: 20 }
+        });
+        if (res.data.success) {
+          setCommandHistory(res.data.history);
+        }
+      } catch (err) {
+        console.error('Failed to fetch command history:', err);
+      }
+    };
+    
+    fetchHistory();
+    const interval = setInterval(fetchHistory, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const takeScreenshot = async () => {
+    if (!selectedDevice) return;
+    
+    try {
+      const res = await axios.get('http://localhost:3001/api/adb/screenshot', {
+        params: { deviceId: selectedDevice }
+      });
+      if (res.data.success) {
+        setScreenshot(res.data.image);
+      }
+    } catch (err) {
+      console.error('Failed to take screenshot:', err);
+    }
+  };
+
   const handleCliSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!cliInput.trim()) return;
+    if (!cliInput.trim() || !selectedDevice) return;
 
     if (cliInput.startsWith('/shell ')) {
       const command = cliInput.replace('/shell ', '');
       try {
-        await axios.post('http://localhost:3001/api/adb/execute', { command });
+        setAgentState('processing');
+        await axios.post('http://localhost:3001/api/adb/execute', { 
+          command,
+          deviceId: selectedDevice 
+        });
       } catch (err) {
-        console.error(err);
+        console.error('Command execution failed:', err);
+      } finally {
+        setAgentState('idle');
       }
     } else {
       setLogs(prev => [...prev, { 
@@ -81,15 +191,79 @@ const App: React.FC = () => {
     setCliInput('');
   };
 
-  const takeScreenshot = async () => {
+  // VLA Loop: Trigger AI analysis
+  const triggerVLALoop = async () => {
+    if (!screenshot || !selectedDevice) return;
+
     try {
-      const res = await axios.get('http://localhost:3001/api/adb/screenshot');
+      setVlaTrigger(true);
+      setAgentState('processing');
+
+      const prompt = `Analyze this Android device screenshot and predict the next ADB command to execute. 
+        Respond with the ADB command in the format: adb shell <command>
+        Consider the current UI state and suggest a logical next action.`;
+
+      const res = await axios.post('http://localhost:3001/api/ai/process', {
+        model: selectedModel,
+        prompt,
+        screenshot,
+        deviceId: selectedDevice
+      });
+
       if (res.data.success) {
-        setScreenshot(res.data.image);
+        setCommandConfirmation({
+          sessionId: res.data.sessionId,
+          predictedCommand: res.data.predictedCommand || 'shell input tap 500 500',
+          confidence: res.data.confidence || 0.75,
+          aiResponse: res.data.response
+        });
+        setAgentState('confirming');
       }
     } catch (err) {
-      console.error(err);
+      console.error('VLA loop failed:', err);
+      setAgentState('idle');
+    } finally {
+      setVlaTrigger(false);
     }
+  };
+
+  // Execute AI-predicted command
+  const executeAIPredictedCommand = async () => {
+    if (!commandConfirmation || !selectedDevice) return;
+
+    try {
+      setAgentState('processing');
+      const res = await axios.post('http://localhost:3001/api/adb/execute', {
+        command: commandConfirmation.predictedCommand,
+        deviceId: selectedDevice
+      });
+
+      if (res.data.success) {
+        setExecutionResult(res.data.result);
+        setLogs(prev => [...prev, {
+          type: 'ai',
+          message: `AI Command Executed: ${commandConfirmation.predictedCommand}`,
+          result: res.data.result,
+          timestamp: new Date().toLocaleTimeString()
+        }]);
+      }
+    } catch (err) {
+      console.error('Failed to execute AI command:', err);
+    } finally {
+      setCommandConfirmation(null);
+      setAgentState('idle');
+    }
+  };
+
+  // Reject AI prediction
+  const rejectAIPrediction = () => {
+    setCommandConfirmation(null);
+    setAgentState('idle');
+    setLogs(prev => [...prev, {
+      type: 'system',
+      message: 'AI prediction rejected by user',
+      timestamp: new Date().toLocaleTimeString()
+    }]);
   };
 
   return (
@@ -103,11 +277,26 @@ const App: React.FC = () => {
             <Cpu size={18} className="text-cyber-blue" />
           </div>
           <h1 className="text-xl font-bold tracking-tighter text-white">
-            DAV<span className="text-cyber-blue">CLAW</span> <span className="text-[10px] font-normal opacity-50">v1.0.4-ALPHA</span>
+            DAV<span className="text-cyber-blue">CLAW</span> <span className="text-[10px] font-normal opacity-50">v2.0-BETA</span>
           </h1>
         </div>
 
         <div className="flex items-center gap-6">
+          {/* Device Selector */}
+          <select 
+            value={selectedDevice}
+            onChange={(e) => setSelectedDevice(e.target.value)}
+            className="bg-cyber-gray border border-cyber-blue/30 text-cyber-blue text-[10px] px-2 py-1 outline-none focus:border-cyber-blue"
+          >
+            <option value="">Select Device</option>
+            {adbStatus.devices.map(device => (
+              <option key={device.id} value={device.id}>
+                {device.id} ({device.status})
+              </option>
+            ))}
+          </select>
+
+          {/* ADB Status */}
           <div className="flex items-center gap-2">
             <div className={cn(
               "w-2 h-2 rounded-full animate-pulse",
@@ -118,16 +307,21 @@ const App: React.FC = () => {
             </span>
           </div>
           
+          {/* Model Selector */}
           <select 
             value={selectedModel}
             onChange={(e) => setSelectedModel(e.target.value)}
             className="bg-cyber-gray border border-cyber-blue/30 text-cyber-blue text-[10px] px-2 py-1 outline-none focus:border-cyber-blue"
           >
-            <option>Gemini 1.5 Pro</option>
-            <option>Claude 3.5 Sonnet</option>
-            <option>Ollama (Llama 3)</option>
-            <option>Groq (Mixtral)</option>
+            <option>Gemini</option>
+            <option>Claude</option>
+            <option>Ollama</option>
           </select>
+
+          {/* Settings Button */}
+          <button className="text-cyber-blue/40 hover:text-cyber-blue transition-colors">
+            <Settings size={16} />
+          </button>
         </div>
       </header>
 
@@ -136,15 +330,22 @@ const App: React.FC = () => {
         
         {/* Left Panel: VLA Loop & Device View */}
         <section className="w-1/3 flex flex-col gap-4">
+          {/* Device Screenshot */}
           <div className="flex-1 cyber-border rounded-lg p-4 flex flex-col relative overflow-hidden">
             <div className="flex items-center justify-between mb-4">
               <div className="flex items-center gap-2">
                 <Smartphone size={16} />
                 <span className="text-xs font-bold uppercase">Device Stream</span>
+                {deviceInfo && (
+                  <span className="text-[9px] text-cyber-blue/60 ml-auto">
+                    Battery: {deviceInfo.batteryLevel}%
+                  </span>
+                )}
               </div>
               <button 
                 onClick={takeScreenshot}
-                className="text-[10px] border border-cyber-blue/30 px-2 py-1 hover:bg-cyber-blue/10"
+                disabled={!selectedDevice}
+                className="text-[10px] border border-cyber-blue/30 px-2 py-1 hover:bg-cyber-blue/10 disabled:opacity-50"
               >
                 REFRESH
               </button>
@@ -156,11 +357,13 @@ const App: React.FC = () => {
               ) : (
                 <div className="text-cyber-blue/20 flex flex-col items-center gap-2">
                   <Activity size={48} className="animate-pulse" />
-                  <span className="text-[10px] uppercase tracking-widest">No Signal</span>
+                  <span className="text-[10px] uppercase tracking-widest">
+                    {selectedDevice ? 'No Signal' : 'Select Device'}
+                  </span>
                 </div>
               )}
               
-              {/* VLA Overlay */}
+              {/* AI Processing Overlay */}
               <AnimatePresence>
                 {agentState === 'processing' && (
                   <motion.div 
@@ -177,6 +380,22 @@ const App: React.FC = () => {
                 )}
               </AnimatePresence>
             </div>
+
+            {/* VLA Trigger Button */}
+            <button
+              onClick={triggerVLALoop}
+              disabled={!screenshot || !selectedDevice || vlaTrigger}
+              className={cn(
+                "mt-4 w-full py-2 border border-cyber-blue/30 rounded font-bold text-xs uppercase tracking-widest",
+                "transition-all duration-300 flex items-center justify-center gap-2",
+                vlaTrigger || agentState === 'processing'
+                  ? "bg-cyber-yellow/20 text-cyber-yellow border-cyber-yellow/50 cursor-not-allowed"
+                  : "hover:bg-cyber-blue/10 text-cyber-blue"
+              )}
+            >
+              <Zap size={14} />
+              {vlaTrigger ? 'ANALYZING...' : 'TRIGGER VLA LOOP'}
+            </button>
           </div>
 
           {/* DAVSI Companion */}
@@ -190,7 +409,7 @@ const App: React.FC = () => {
                 transition={{ repeat: Infinity, duration: 2 }}
                 className="w-full h-full bg-cyber-blue/10 border border-cyber-blue/30 rounded-full flex items-center justify-center overflow-hidden"
               >
-                {/* Simple SVG Avatar */}
+                {/* Avatar SVG */}
                 <svg viewBox="0 0 100 100" className="w-12 h-12 fill-cyber-blue">
                   <path d="M50 20c-16.5 0-30 13.5-30 30s13.5 30 30 30 30-13.5 30-30-13.5-30-30-30zm0 50c-11 0-20-9-20-20s9-20 20-20 20 9 20 20-9 20-20 20z" />
                   <circle cx="35" cy="45" r="5" />
@@ -200,7 +419,8 @@ const App: React.FC = () => {
               </motion.div>
               <div className={cn(
                 "absolute -bottom-1 -right-1 w-4 h-4 rounded-full border-2 border-cyber-black",
-                agentState === 'processing' ? "bg-cyber-yellow" : "bg-cyber-green"
+                agentState === 'processing' ? "bg-cyber-yellow" : 
+                agentState === 'confirming' ? "bg-cyber-pink" : "bg-cyber-green"
               )} />
             </div>
             <div className="flex-1">
@@ -208,18 +428,79 @@ const App: React.FC = () => {
               <p className="text-[10px] text-cyber-blue/60 leading-tight">
                 {agentState === 'processing' 
                   ? "Analyzing visual input and calculating next ADB action..." 
-                  : "System idle. Waiting for user command or VLA trigger."}
+                  : agentState === 'confirming'
+                  ? "Awaiting user confirmation for predicted command..."
+                  : "System idle. Ready for VLA trigger or user command."}
               </p>
             </div>
           </div>
         </section>
 
-        {/* Right Panel: Logs & Terminal */}
+        {/* Right Panel: Logs, Terminal & Command Confirmation */}
         <section className="flex-1 flex flex-col gap-4">
+          {/* Command Confirmation Panel */}
+          <AnimatePresence>
+            {commandConfirmation && agentState === 'confirming' && (
+              <motion.div
+                initial={{ opacity: 0, y: -20 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -20 }}
+                className="cyber-border rounded-lg p-4 bg-cyber-dark/50 border-cyber-pink/50"
+              >
+                <div className="flex items-start justify-between mb-3">
+                  <div className="flex items-center gap-2">
+                    <AlertCircle size={16} className="text-cyber-pink" />
+                    <h3 className="text-xs font-bold uppercase text-cyber-pink">AI Prediction Confirmation</h3>
+                  </div>
+                  <span className="text-[9px] text-cyber-blue/60">
+                    Confidence: {(commandConfirmation.confidence * 100).toFixed(0)}%
+                  </span>
+                </div>
+                
+                <div className="bg-black/40 rounded p-3 mb-3 border border-white/5">
+                  <p className="text-[10px] text-cyber-blue/80 mb-2">Predicted Command:</p>
+                  <code className="text-[11px] text-cyber-green font-mono">{commandConfirmation.predictedCommand}</code>
+                </div>
+
+                <div className="bg-black/40 rounded p-3 mb-3 border border-white/5 max-h-24 overflow-y-auto">
+                  <p className="text-[10px] text-cyber-blue/80 mb-2">AI Analysis:</p>
+                  <p className="text-[10px] text-white/70">{commandConfirmation.aiResponse}</p>
+                </div>
+
+                <div className="flex gap-2">
+                  <button
+                    onClick={executeAIPredictedCommand}
+                    className="flex-1 py-2 bg-cyber-green/20 border border-cyber-green/50 text-cyber-green text-xs font-bold uppercase rounded hover:bg-cyber-green/30 transition-colors flex items-center justify-center gap-2"
+                  >
+                    <Check size={14} />
+                    Execute
+                  </button>
+                  <button
+                    onClick={rejectAIPrediction}
+                    className="flex-1 py-2 bg-red-500/20 border border-red-500/50 text-red-500 text-xs font-bold uppercase rounded hover:bg-red-500/30 transition-colors flex items-center justify-center gap-2"
+                  >
+                    <X size={14} />
+                    Reject
+                  </button>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* Logs Panel */}
           <div className="flex-1 cyber-border rounded-lg flex flex-col overflow-hidden">
-            <div className="h-10 border-b border-cyber-blue/20 flex items-center px-4 bg-cyber-blue/5">
-              <Terminal size={14} className="mr-2" />
-              <span className="text-[10px] font-bold uppercase tracking-widest">Real-time System Logs</span>
+            <div className="h-10 border-b border-cyber-blue/20 flex items-center px-4 bg-cyber-blue/5 justify-between">
+              <div className="flex items-center gap-2">
+                <Terminal size={14} />
+                <span className="text-[10px] font-bold uppercase tracking-widest">Real-time System Logs</span>
+              </div>
+              <button
+                onClick={() => setShowHistory(!showHistory)}
+                className="text-[10px] text-cyber-blue/60 hover:text-cyber-blue transition-colors flex items-center gap-1"
+              >
+                <History size={12} />
+                History
+              </button>
             </div>
             
             <div className="flex-1 overflow-y-auto p-4 space-y-2 font-mono text-[11px]">
@@ -238,8 +519,8 @@ const App: React.FC = () => {
                   <div className="flex-1">
                     <p className="text-white/90">{log.message}</p>
                     {log.result && (
-                      <pre className="mt-1 p-2 bg-black/40 border border-white/5 text-cyber-green/80 overflow-x-auto">
-                        {log.result}
+                      <pre className="mt-1 p-2 bg-black/40 border border-white/5 text-cyber-green/80 overflow-x-auto text-[9px]">
+                        {log.result.substring(0, 200)}
                       </pre>
                     )}
                   </div>
@@ -256,9 +537,14 @@ const App: React.FC = () => {
                 value={cliInput}
                 onChange={(e) => setCliInput(e.target.value)}
                 placeholder="Enter command (e.g. /shell shell input tap 500 500)"
-                className="flex-1 bg-transparent outline-none text-xs text-white placeholder:text-cyber-blue/20"
+                disabled={!selectedDevice}
+                className="flex-1 bg-transparent outline-none text-xs text-white placeholder:text-cyber-blue/20 disabled:opacity-50"
               />
-              <button type="submit" className="text-cyber-blue/40 hover:text-cyber-blue transition-colors">
+              <button 
+                type="submit" 
+                disabled={!selectedDevice}
+                className="text-cyber-blue/40 hover:text-cyber-blue transition-colors disabled:opacity-50"
+              >
                 <Send size={16} />
               </button>
             </form>
@@ -271,17 +557,21 @@ const App: React.FC = () => {
       <footer className="h-8 border-t border-cyber-blue/20 flex items-center justify-between px-6 bg-cyber-dark text-[9px] uppercase tracking-[0.2em] z-20">
         <div className="flex gap-6">
           <div className="flex items-center gap-2">
-            <span className="opacity-40">CPU:</span>
-            <span className="text-cyber-green">12%</span>
+            <span className="opacity-40">Devices:</span>
+            <span className="text-cyber-green">{adbStatus.devices.length}</span>
           </div>
           <div className="flex items-center gap-2">
-            <span className="opacity-40">MEM:</span>
-            <span className="text-cyber-green">1.2GB</span>
+            <span className="opacity-40">Logs:</span>
+            <span className="text-cyber-green">{logs.length}</span>
           </div>
-          <div className="flex items-center gap-2">
-            <span className="opacity-40">LATENCY:</span>
-            <span className="text-cyber-yellow">42ms</span>
-          </div>
+          {deviceInfo && (
+            <div className="flex items-center gap-2">
+              <span className="opacity-40">Battery:</span>
+              <span className={deviceInfo.batteryLevel > 20 ? "text-cyber-green" : "text-cyber-yellow"}>
+                {deviceInfo.batteryLevel}%
+              </span>
+            </div>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <Activity size={10} className="text-cyber-green" />
