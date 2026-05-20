@@ -1,0 +1,14 @@
+{
+  "name": "davclaw-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "install:all": "npm install --prefix backend && pnpm install --prefix frontend",
+    "dev:backend": "npm start --prefix backend",
+    "dev:frontend": "pnpm dev --prefix frontend",
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\""
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
